@@ -2,9 +2,14 @@
 
 import io
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env before any Hugging Face calls
 
 import joblib
 import numpy as np
@@ -12,7 +17,7 @@ import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
-from transformers import CLIPModel, CLIPProcessor
+from transformers import AutoImageProcessor, AutoModel
 
 
 logging.basicConfig(
@@ -29,15 +34,15 @@ logger = logging.getLogger("ai_image_detector")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = BASE_DIR / "models" / "svm_v2.pkl"
+MODEL_PATH = BASE_DIR / "models" / "dinov3_linear_clf-v2.pkl"
 
-CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
+DINOV3_MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 
 IMAGE_SIZE = (224, 224)
 
-FEATURE_DIM = 768
+FEATURE_DIM = 1024
 
-AI_THRESHOLD = 0.5
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 
 # --------------------------------------------------
@@ -52,20 +57,22 @@ def select_device() -> torch.device:
 
 
 # --------------------------------------------------
-# CLIP
+# DINOv3
 # --------------------------------------------------
 
-def load_clip(
+def load_dinov3(
     device: torch.device,
-) -> tuple[CLIPModel, CLIPProcessor]:
-    """Load CLIP model and processor."""
+) -> tuple[AutoModel, AutoImageProcessor]:
+    """Load DINOv3 model and processor."""
 
-    processor = CLIPProcessor.from_pretrained(
-        CLIP_MODEL_NAME
+    processor = AutoImageProcessor.from_pretrained(
+        DINOV3_MODEL_NAME,
+        token=HF_TOKEN,
     )
 
-    model = CLIPModel.from_pretrained(
-        CLIP_MODEL_NAME
+    model = AutoModel.from_pretrained(
+        DINOV3_MODEL_NAME,
+        token=HF_TOKEN,
     )
 
     model.to(device)
@@ -76,16 +83,19 @@ def load_clip(
 
 
 # --------------------------------------------------
-# SVM
+# Classifier
 # --------------------------------------------------
 
-def load_svm(path: Path) -> Any:
-    """Load the trained V2 SVM."""
+def load_classifier(path: Path) -> dict:
+    """Load the trained DINOv3 linear classifier bundle.
+
+    Returns a dict with keys: 'scaler', 'clf', 'threshold'.
+    """
 
     if not path.is_file():
         raise FileNotFoundError(
-            f"SVM model not found at '{path}'. "
-            "Make sure svm_v2.pkl exists inside models/."
+            f"Classifier not found at '{path}'. "
+            "Make sure dinov3_linear_clf.pkl exists inside models/."
         )
 
     return joblib.load(path)
@@ -98,62 +108,47 @@ def load_svm(path: Path) -> Any:
 @torch.no_grad()
 def extract_features(
     image: Image.Image,
-    model: CLIPModel,
-    processor: CLIPProcessor,
+    model: AutoModel,
+    processor: AutoImageProcessor,
     device: torch.device,
 ) -> np.ndarray:
     """
-    Extract the 768-dimensional CLIP image feature.
+    Extract the 1024-dimensional DINOv3 image feature.
 
-    Pipeline matches the V2 Kaggle pipeline:
+    Pipeline:
 
     RGB
         ↓
     Resize 224x224
         ↓
-    CLIP processor
+    DINOv3 processor
         ↓
-    CLIP get_image_features()
+    DINOv3 forward pass
         ↓
-    pooler_output
-        ↓
-    L2 normalization
+    CLS token (last_hidden_state[:, 0])
     """
 
     # RGB + resize
     image = image.convert("RGB").resize(IMAGE_SIZE)
 
-    # CLIP preprocessing
+    # DINOv3 preprocessing
     inputs = processor(
         images=image,
         return_tensors="pt",
     ).to(device)
 
-    # CLIP feature extraction
-    outputs = model.get_image_features(**inputs)
+    # DINOv3 feature extraction
+    outputs = model(**inputs)
 
-    # Transformers versions can return either
-    # a model output object or the tensor directly.
-    features = (
-        outputs.pooler_output
-        if hasattr(outputs, "pooler_output")
-        else outputs
-    )
+    # Use the CLS token from the last hidden state
+    features = outputs.last_hidden_state[:, 0]
 
     # Safety check
     if features.shape[-1] != FEATURE_DIM:
         raise RuntimeError(
-            f"Unexpected CLIP feature dimension "
+            f"Unexpected DINOv3 feature dimension "
             f"{features.shape[-1]}; expected {FEATURE_DIM}."
         )
-
-    # IMPORTANT:
-    # V2 was trained on L2-normalized CLIP features.
-    features = torch.nn.functional.normalize(
-        features,
-        p=2,
-        dim=-1,
-    )
 
     return features.cpu().numpy()
 
@@ -172,36 +167,43 @@ async def lifespan(app: FastAPI):
         device,
     )
 
-    # Load CLIP
-    model, processor = load_clip(device)
+    # Load DINOv3
+    model, processor = load_dinov3(device)
 
     logger.info(
-        "CLIP model loaded: %s",
-        CLIP_MODEL_NAME,
+        "DINOv3 model loaded: %s",
+        DINOV3_MODEL_NAME,
     )
 
-    # Load V2 SVM
-    svm = load_svm(MODEL_PATH)
+    # Load classifier bundle
+    clf_bundle = load_classifier(MODEL_PATH)
 
     logger.info(
-        "V2 SVM loaded: %s",
+        "Classifier loaded: %s",
         MODEL_PATH,
     )
 
     logger.info(
-        "SVM type: %s",
-        type(svm),
+        "Classifier type: %s",
+        type(clf_bundle["clf"]),
     )
 
     logger.info(
-        "SVM classes: %s",
-        svm.classes_,
+        "Classifier classes: %s",
+        clf_bundle["clf"].classes_,
+    )
+
+    logger.info(
+        "Threshold: %s",
+        clf_bundle["threshold"],
     )
 
     app.state.device = device
-    app.state.clip_model = model
-    app.state.clip_processor = processor
-    app.state.svm = svm
+    app.state.dinov3_model = model
+    app.state.dinov3_processor = processor
+    app.state.scaler = clf_bundle["scaler"]
+    app.state.clf = clf_bundle["clf"]
+    app.state.threshold = clf_bundle["threshold"]
 
     yield
 
@@ -267,17 +269,22 @@ async def predict(
 
     def _infer() -> float:
 
-        # Extract V2-compatible CLIP features
+        # Extract DINOv3 features
         features = extract_features(
             image,
-            state.clip_model,
-            state.clip_processor,
+            state.dinov3_model,
+            state.dinov3_processor,
             state.device,
         )
 
-        # V2 SVM probability
-        ai_probability = state.svm.predict_proba(
+        # Scale features
+        features_scaled = state.scaler.transform(
             features
+        )
+
+        # Classifier probability
+        ai_probability = state.clf.predict_proba(
+            features_scaled
         )[0, 1]
 
         return float(ai_probability)
@@ -287,8 +294,8 @@ async def predict(
         _infer
     )
 
-    # Classification
-    is_ai = ai_probability >= AI_THRESHOLD
+    # Classification using trained threshold
+    is_ai = ai_probability >= state.threshold
 
     prediction = (
         "AI Generated"

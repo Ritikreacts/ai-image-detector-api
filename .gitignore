@@ -34,3 +34,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Trained models
+models/*.pkl
+models/*.vpk
