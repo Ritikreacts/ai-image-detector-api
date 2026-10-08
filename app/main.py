@@ -17,6 +17,14 @@ import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from transformers import AutoImageProcessor, AutoModel
 
 
@@ -43,6 +51,11 @@ IMAGE_SIZE = (224, 224)
 FEATURE_DIM = 1024
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+# Module-level reference to the Telegram Application
+telegram_app: Application | None = None
 
 
 # --------------------------------------------------
@@ -154,11 +167,131 @@ def extract_features(
 
 
 # --------------------------------------------------
+# Shared inference helper
+# --------------------------------------------------
+
+def _run_inference(image: Image.Image, state: Any) -> dict:
+    """Run the full inference pipeline on a PIL Image.
+
+    Returns a dict with 'prediction', 'ai_probability', 'confidence'.
+    This is the single source of truth used by both the REST endpoint
+    and the Telegram bot handler.
+    """
+
+    # Extract DINOv3 features
+    features = extract_features(
+        image,
+        state.dinov3_model,
+        state.dinov3_processor,
+        state.device,
+    )
+
+    # Scale features
+    features_scaled = state.scaler.transform(features)
+
+    # Classifier probability
+    ai_probability = float(
+        state.clf.predict_proba(features_scaled)[0, 1]
+    )
+
+    # Classification using trained threshold
+    is_ai = ai_probability >= state.threshold
+
+    prediction = "AI Generated" if is_ai else "Real"
+
+    confidence = (
+        ai_probability if is_ai else 1.0 - ai_probability
+    )
+
+    return {
+        "prediction": prediction,
+        "ai_probability": ai_probability,
+        "confidence": confidence,
+    }
+
+
+# --------------------------------------------------
+# Telegram bot handlers
+# --------------------------------------------------
+
+async def tg_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle the /start command."""
+    await update.message.reply_text(
+        "👋 Send me an image and I'll tell you whether "
+        "it is AI-generated or real."
+    )
+
+
+async def tg_handle_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle incoming photos: run inference and reply."""
+
+    message = update.message
+
+    # Get the highest-resolution version of the photo
+    photo = message.photo[-1]
+
+    telegram_file = await context.bot.get_file(
+        photo.file_id
+    )
+
+    # Download image into memory
+    image_bytes = await telegram_file.download_as_bytearray()
+
+    await message.reply_text("🔍 Analyzing image...")
+
+    try:
+        # Validate the image (same checks as /predict)
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            image.load()
+
+        except (
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+        ):
+            await message.reply_text(
+                "❌ That doesn't look like a valid image."
+            )
+            return
+
+        state = app.state
+
+        # Run inference in a thread to avoid blocking
+        result = await run_in_threadpool(
+            _run_inference, image, state
+        )
+
+        confidence_pct = result["confidence"] * 100
+
+        await message.reply_text(
+            f"🤖 Prediction: {result['prediction']}\n"
+            f"🎯 Confidence: {confidence_pct:.2f}%"
+        )
+
+    except Exception:
+        logger.exception("Telegram image handler error")
+
+        await message.reply_text(
+            "❌ Something went wrong while analyzing "
+            "the image."
+        )
+
+
+# --------------------------------------------------
 # Application lifespan
 # --------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    global telegram_app
 
     device = select_device()
 
@@ -205,7 +338,45 @@ async def lifespan(app: FastAPI):
     app.state.clf = clf_bundle["clf"]
     app.state.threshold = clf_bundle["threshold"]
 
+    # --------------------------------------------------
+    # Start Telegram bot inside the same process
+    # --------------------------------------------------
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN environment variable is not set."
+        )
+
+    telegram_app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    telegram_app.add_handler(
+        CommandHandler("start", tg_start)
+    )
+    telegram_app.add_handler(
+        MessageHandler(filters.PHOTO, tg_handle_image)
+    )
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+
+    logger.info("Telegram bot started (polling)")
+
     yield
+
+    # --------------------------------------------------
+    # Shutdown Telegram bot
+    # --------------------------------------------------
+
+    logger.info("Stopping Telegram bot...")
+
+    await telegram_app.updater.stop()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
 
     logger.info(
         "Shutting down AI Image Detector API"
@@ -267,50 +438,9 @@ async def predict(
 
     state = app.state
 
-    def _infer() -> float:
-
-        # Extract DINOv3 features
-        features = extract_features(
-            image,
-            state.dinov3_model,
-            state.dinov3_processor,
-            state.device,
-        )
-
-        # Scale features
-        features_scaled = state.scaler.transform(
-            features
-        )
-
-        # Classifier probability
-        ai_probability = state.clf.predict_proba(
-            features_scaled
-        )[0, 1]
-
-        return float(ai_probability)
-
     # Run inference without blocking FastAPI
-    ai_probability = await run_in_threadpool(
-        _infer
+    result = await run_in_threadpool(
+        _run_inference, image, state
     )
 
-    # Classification using trained threshold
-    is_ai = ai_probability >= state.threshold
-
-    prediction = (
-        "AI Generated"
-        if is_ai
-        else "Real"
-    )
-
-    confidence = (
-        ai_probability
-        if is_ai
-        else 1.0 - ai_probability
-    )
-
-    return {
-        "prediction": prediction,
-        "ai_probability": ai_probability,
-        "confidence": confidence,
-    }
+    return result
