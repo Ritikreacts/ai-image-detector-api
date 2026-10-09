@@ -1,9 +1,12 @@
 """FastAPI application entry point for the AI Image Detector API."""
 
+import base64
 import io
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,9 @@ FEATURE_DIM = 1024
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+LOG_DIR = BASE_DIR / "logs"
+REQUEST_LOG_FILE = LOG_DIR / "requests.json"
 
 # Module-level reference to the Telegram Application
 telegram_app: Application | None = None
@@ -211,6 +217,78 @@ def _run_inference(image: Image.Image, state: Any) -> dict:
 
 
 # --------------------------------------------------
+# Request logging
+# --------------------------------------------------
+
+def _image_to_base64_thumbnail(
+    image: Image.Image,
+    max_size: int = 256,
+) -> str:
+    """Return a base64-encoded JPEG thumbnail of the image.
+
+    The image is resized so the longest side is *max_size* pixels
+    to keep the log file size manageable.
+    """
+    thumb = image.copy()
+    thumb.thumbnail((max_size, max_size))
+    buf = io.BytesIO()
+    thumb.save(buf, format="JPEG", quality=70)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _log_request(
+    *,
+    source: str,
+    filename: str,
+    image: Image.Image,
+    result: dict,
+) -> None:
+    """Append a prediction entry to the JSON log file.
+
+    Each entry contains:
+    - timestamp (ISO-8601 UTC)
+    - source ('api' | 'telegram')
+    - filename
+    - image_thumbnail (base64 JPEG)
+    - prediction response
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "filename": filename,
+        "image_thumbnail": _image_to_base64_thumbnail(image),
+        "result": result,
+    }
+
+    # Read existing log entries (if any)
+    if REQUEST_LOG_FILE.is_file():
+        try:
+            entries = json.loads(
+                REQUEST_LOG_FILE.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError):
+            entries = []
+    else:
+        entries = []
+
+    entries.append(entry)
+
+    REQUEST_LOG_FILE.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    logger.info(
+        "Logged request: source=%s  filename=%s  prediction=%s",
+        source,
+        filename,
+        result.get("prediction"),
+    )
+
+
+# --------------------------------------------------
 # Telegram bot handlers
 # --------------------------------------------------
 
@@ -267,6 +345,17 @@ async def tg_handle_image(
         result = await run_in_threadpool(
             _run_inference, image, state
         )
+
+        # Log the request
+        try:
+            _log_request(
+                source="telegram",
+                filename=f"telegram_{photo.file_unique_id}.jpg",
+                image=image,
+                result=result,
+            )
+        except Exception:
+            logger.exception("Failed to log Telegram request")
 
         confidence_pct = result["confidence"] * 100
 
@@ -442,5 +531,16 @@ async def predict(
     result = await run_in_threadpool(
         _run_inference, image, state
     )
+
+    # Log the request
+    try:
+        _log_request(
+            source="api",
+            filename=file.filename or "unknown",
+            image=image,
+            result=result,
+        )
+    except Exception:
+        logger.exception("Failed to log API request")
 
     return result
