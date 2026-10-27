@@ -211,7 +211,7 @@ ai-image-detector-api/
 │   ├── __init__.py              # Package marker
 │   └── main.py                  # FastAPI app + Telegram bot (single process)
 ├── models/
-│   └── dinov3_linear_clf-v2.pkl # Trained linear classifier bundle (scaler + clf + threshold)
+│   └── v2.pkl                   # Trained linear classifier bundle (scaler + clf + threshold)
 ├── Dockerfile                   # Production container for Render
 ├── .dockerignore
 ├── .env                         # Environment variables (not committed)

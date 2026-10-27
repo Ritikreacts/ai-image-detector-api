@@ -45,7 +45,7 @@ logger = logging.getLogger("ai_image_detector")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = BASE_DIR / "models" / "dinov3_linear_clf-v2.pkl"
+MODEL_PATH = BASE_DIR / "models" / "v2.pkl"
 
 DINOV3_MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 
@@ -114,7 +114,7 @@ def load_classifier(path: Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(
             f"Classifier not found at '{path}'. "
-            "Make sure dinov3_linear_clf.pkl exists inside models/."
+            "Make sure v2.pkl exists inside models/."
         )
 
     return joblib.load(path)
